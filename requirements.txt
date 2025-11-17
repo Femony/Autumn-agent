@@ -1,0 +1,7 @@
+openai>=1.50.2
+python-dotenv
+beautifulsoup4
+requests
+schedule
+yagmail
+fpdf
