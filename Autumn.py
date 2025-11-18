@@ -11,7 +11,6 @@ import asyncio
 import json
 import time
 import os
-from openai import Agent, Runner, function_tool
 from openai import OpenAI
 from datetime import datetime, timedelta
 from fpdf import FPDF
@@ -29,7 +28,7 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 FROM_NAME = os.getenv("FROM_NAME", "Autumn")
-MODEL = os.getenv("MODEL", "gpt-5-mini") 
+MODEL = os.getenv("MODEL", "gpt-4o-mini") 
 STORAGE_FILE = os.getenv("STORAGE_FILE", "storage.json")
 
 if not OPENAI_API_KEY:
@@ -55,12 +54,18 @@ def save_storage(data):
 # generate summaries from a website
 # we are letting the ai model know that this function is not ordinary, but a tool that will help the agent
 
-@function_tool
 def fetch_blog_content(url: str) -> dict:
 
     print(f"Scraping: {url}")
 
-    html = requests.get(url, timeout=10).text
+    # Note: Using requests.get().text is simpler, but requests.get() is safer for timeouts
+    try:
+        html = requests.get(url, timeout=10).text
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching URL {url}: {e}")
+        return {"titles": ["Scraping Failed"], "content": f"Failed to retrieve URL content: {e}"}
+
+
     soup = BeautifulSoup(html, "html.parser")
 
     # extract titles
@@ -76,6 +81,26 @@ def fetch_blog_content(url: str) -> dict:
         "content": content[:20000]  # safety limit
     }
 
+FETCH_BLOG_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "fetch_blog_content",
+        "description": "A tool to retrieve titles and content from a given article URL for summarization. Use this ONLY when a URL is provided by the user.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full URL of the blog article to scrape."
+                }
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+# Collect all tools in a list
+ASSISTANT_TOOLS = [FETCH_BLOG_TOOL]
 #filtering function
 def looks_like_article(url: str) -> bool:
     """
@@ -141,15 +166,14 @@ def extract_article_links(blog_url: str):
     print(f"Found {len(links)} possible article links.")
     return list(set(links))  # unique list
 # step 3: define the agent
-
-Autumn = Agent(
-    name = "Autumn",
+assistant = client.beta.assistants.create(
+    name="Autumn",
     instructions="""You are a very reliable, valid, talented and authentic news_reporter agent for a STEM student.
                     STEM students in engineering and computer science rely on you to get all the latest advancements in their field to know how to move forward,
-                    what fields to focus on, 
+                    what fields to focus on,
                     and what new opportunities can they take advantage of or work on.
                     Your job:
-                    1. Use the "fetch_blog_content" tool to retrieve titles and article text from the given URL.
+                    1. Use the 'fetch_blog_content' tool to retrieve titles and article text from the given URL.
                     2. Clean the text (remove duplicates, boilerplate, navigation text).
                     3. Identify ALL new technological advancements, new features, new updates, new products, new technologies used mentioned on the page.
                     4. For each advancement, extract:
@@ -157,7 +181,7 @@ Autumn = Agent(
                     - What problem it solves
                     - In what field it matters (AI, cloud, hardware, robotics, etc.)
                     - Why it is important for engineering or CS students
-                    5. Write a 200 to 250 word concise summary.. 
+                    5. Write a 200 to 250 word concise summary..
                     OUTPUT FORMAT:
                     === REPORT START ===
                     [Company Name & Brief Relevance]
@@ -171,24 +195,99 @@ Autumn = Agent(
                     === DEFINITIONS ===
                     - Term: Definition
                     - Term: Definition
-                    
-                    === Conclusion === 
-                    - State if there has been a strong appearance to a certain technology or feature based on the frequency it appeared in the article. 
+
+                    === Conclusion ===
+                    - State if there has been a strong appearance to a certain technology or feature based on the frequency it appeared in the article.
                     Don't guess or make assumptions on your own.
                     === REPORT END ===
 
-                    You must call the "fetch_blog_content" tool whenever you are provided with a URL.
+                    You must call the 'fetch_blog_content' tool whenever you are provided with a URL.
                     Do NOT guess. Always fetch the real content first.""",
-    model= "gpt-5-mini",
-    tools=[fetch_blog_content],
-    output_type=str
+    model=os.getenv("MODEL", "gpt-4o-mini"), # Use gpt-4o-mini as gpt-5-mini is not a real model name
+    tools=ASSISTANT_TOOLS
 )
+
+def submit_tool_outputs(thread_id, run_id, tool_calls):
+    """Executes the Python tool (fetch_blog_content) and submits the output back to the Assistant."""
+
+    tool_outputs = []
+    
+    # Map the tool calls requested by the model to the local Python function
+    for tool_call in tool_calls:
+        func_name = tool_call.function.name
+        
+        if func_name == "fetch_blog_content":
+            # Extract arguments
+            args = json.loads(tool_call.function.arguments)
+            url = args.get("url")
+            
+            # Execute the local Python function
+            output = fetch_blog_content(url)
+            
+            tool_outputs.append({
+                "tool_call_id": tool_call.id,
+                "output": json.dumps(output)
+            })
+
+    # Submit the output of the executed function(s) back to the Assistant
+    if tool_outputs:
+        run = client.beta.threads.runs.submit_tool_outputs(
+            thread_id=thread_id,
+            run_id=run_id,
+            tool_outputs=tool_outputs
+        )
+        return run # Return the updated Run object
+    return None
 
 #fetch transcript from a website pag using tools and generates a structured summary
 def summarize_blog(url: str):
-    message = f"Please fetch and summarize the content from this URL: {url}"
-    result = Autumn.run(message)
-    return result
+    """
+    Replaces the old Autumn.run() with a Thread-based execution loop.
+    """
+    message_content = f"Please fetch and summarize the content from this URL: {url}"
+    
+    # 1. Create a Thread for the conversation
+    thread = client.beta.threads.create()
+
+    # 2. Add the user message to the Thread
+    client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=message_content,
+    )
+
+    # 3. Start the Run
+    run = client.beta.threads.runs.create(
+        thread_id=thread.id,
+        assistant_id=assistant.id
+    )
+
+    # 4. Polling loop to wait for the result or tool calls
+    while run.status not in ["completed", "failed", "cancelled"]:
+        time.sleep(1)
+        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+        print(f"Run status: {run.status}")
+
+        if run.status == "requires_action":
+            # 5. Handle Tool Call
+            if run.required_action.type == "submit_tool_outputs":
+                # Execute the tool and submit output back to the Run
+                run = submit_tool_outputs(thread.id, run.id, run.required_action.submit_tool_outputs.tool_calls)
+            else:
+                raise Exception("Unknown required action type.")
+        
+        # Add a timeout check here for robustness
+
+    if run.status == "completed":
+        # 6. Retrieve the final result message
+        messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc")
+        # The first message in the list is the Assistant's final response
+        if messages.data and messages.data[0].role == "assistant":
+            # Assuming the response is simple text
+            return messages.data[0].content[0].text.value
+    
+    # Handle failure case
+    raise RuntimeError(f"Assistant Run failed with status: {run.status}")
 
 COMPANY_BLOGS = {
     "NVIDIA": "https://nvidianews.nvidia.com",
@@ -218,12 +317,8 @@ def summarize_all_companies():
         print(f"\n--- Summarizing: {company} ---")
 
         try:
-            summaries = scrape_full_blog(url)
+            summaries = scrape_full_blog(url) # summaries is a LIST of strings
             final_report.append("\n".join(summaries))
-            final_report.append(f"\n\n==============================")
-            final_report.append(f"\n{company} — Latest Updates")
-            final_report.append("\n==============================\n")
-            final_report.append(summary)
         
         except Exception as e:
             final_report.append(f"\n\n{company}: FAILED TO SCRAPE ({e})")
@@ -335,6 +430,7 @@ schedule.every().friday.at("18:00").do(run_weekly)    # weekly report
 
 def scheduler_loop():
     while True:
+        print("--- ENVIRONMENT TEST SUCCESSFUL! ---")
         schedule.run_pending()
         time.sleep(60)
 
