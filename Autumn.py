@@ -30,19 +30,27 @@ RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 FROM_NAME = os.getenv("FROM_NAME", "Autumn")
 MODEL = os.getenv("MODEL", "gpt-4o-mini") 
 STORAGE_FILE = os.getenv("STORAGE_FILE", "storage.json")
+ASSISTANT_ID_FILE = "assistant_id.txt"
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY in your .env first")
+if not EMAIL_USER or not EMAIL_PASS:
+    print("Warning: Email credentials (EMAIL_USER/EMAIL_PASS) are not set. Email sending will be skipped.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # to help in storage 
 def load_storage():
     """Loads the storage file where we store scraped article URLs."""
+    # Using /tmp for better compatibility on serverless platforms
     if not os.path.exists(STORAGE_FILE):
         return {"articles": {}}  # url -> metadata
-    with open(STORAGE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"Error reading JSON from {STORAGE_FILE}. Starting with empty storage.")
+        return {"articles": {}}
 
 def save_storage(data):
     """Saves the updated scraped article list."""
@@ -144,7 +152,12 @@ def looks_like_article(url: str) -> bool:
 def extract_article_links(blog_url: str):
     print(f"[LINK SCRAPER] Fetching articles from: {blog_url}")
 
-    html = requests.get(blog_url, timeout=10).text
+    try:
+        html = requests.get(blog_url, timeout=10).text
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching blog URL {blog_url}: {e}")
+        return []
+
     soup = BeautifulSoup(html, "html.parser")
 
     links = []
@@ -166,46 +179,75 @@ def extract_article_links(blog_url: str):
     print(f"Found {len(links)} possible article links.")
     return list(set(links))  # unique list
 # step 3: define the agent
-assistant = client.beta.assistants.create(
-    name="Autumn",
-    instructions="""You are a very reliable, valid, talented and authentic news_reporter agent for a STEM student.
-                    STEM students in engineering and computer science rely on you to get all the latest advancements in their field to know how to move forward,
-                    what fields to focus on,
-                    and what new opportunities can they take advantage of or work on.
-                    Your job:
-                    1. Use the 'fetch_blog_content' tool to retrieve titles and article text from the given URL.
-                    2. Clean the text (remove duplicates, boilerplate, navigation text).
-                    3. Identify ALL new technological advancements, new features, new updates, new products, new technologies used mentioned on the page.
-                    4. For each advancement, extract:
-                    - What it is
-                    - What problem it solves
-                    - In what field it matters (AI, cloud, hardware, robotics, etc.)
-                    - Why it is important for engineering or CS students
-                    5. Write a 200 to 250 word concise summary..
-                    OUTPUT FORMAT:
-                    === REPORT START ===
-                    [Company Name & Brief Relevance]
-                    1. [Advancement Title]
-                    - Description:
-                    - Why it matters:
-                    2. [Advancement Title]
-                    - Description:
-                    - Why it matters:
+def get_or_create_assistant():
+    """
+    Checks for a cached Assistant ID. If found, retrieves the existing assistant.
+    If not found, creates a new one and saves the ID.
+    """
+    assistant_id = None
+    if os.path.exists(ASSISTANT_ID_FILE):
+        try:
+            with open(ASSISTANT_ID_FILE, "r") as f:
+                assistant_id = f.read().strip()
+                print(f"Found cached Assistant ID: {assistant_id}. Retrieving...")
+                return client.beta.assistants.retrieve(assistant_id)
+        except Exception as e:
+            print(f"Error retrieving cached assistant: {e}. Creating new assistant.")
 
-                    === DEFINITIONS ===
-                    - Term: Definition
-                    - Term: Definition
+    print("Creating new Autumn Assistant...")
+    assistant = client.beta.assistants.create(
+        name="Autumn",
+        instructions="""You are a very reliable, valid, talented and authentic news_reporter agent for a STEM student.
+                        STEM students in engineering and computer science rely on you to get all the latest advancements in their field to know how to move forward,
+                        what fields to focus on,
+                        and what new opportunities can they take advantage of or work on.
+                        Your job:
+                        1. Use the 'fetch_blog_content' tool to retrieve titles and article text from the given URL.
+                        2. Clean the text (remove duplicates, boilerplate, navigation text).
+                        3. Identify ALL new technological advancements, new features, new updates, new products, new technologies used mentioned on the page.
+                        4. For each advancement, extract:
+                        - What it is
+                        - What problem it solves
+                        - In what field it matters (AI, cloud, hardware, robotics, etc.)
+                        - Why it is important for engineering or CS students
+                        5. Write a 200 to 250 word concise summary..
+                        OUTPUT FORMAT:
+                        === REPORT START ===
+                        [Company Name & Brief Relevance]
+                        1. [Advancement Title]
+                        - Description:
+                        - Why it matters:
+                        2. [Advancement Title]
+                        - Description:
+                        - Why it matters:
 
-                    === Conclusion ===
-                    - State if there has been a strong appearance to a certain technology or feature based on the frequency it appeared in the article.
-                    Don't guess or make assumptions on your own.
-                    === REPORT END ===
+                        === DEFINITIONS ===
+                        - Term: Definition
+                        - Term: Definition
 
-                    You must call the 'fetch_blog_content' tool whenever you are provided with a URL.
-                    Do NOT guess. Always fetch the real content first.""",
-    model=os.getenv("MODEL", "gpt-4o-mini"), # Use gpt-4o-mini as gpt-5-mini is not a real model name
-    tools=ASSISTANT_TOOLS
-)
+                        === Conclusion ===
+                        - State if there has been a strong appearance to a certain technology or feature based on the frequency it appeared in the article.
+                        Don't guess or make assumptions on your own.
+                        === REPORT END ===
+
+                        You must call the 'fetch_blog_content' tool whenever you are provided with a URL.
+                        Do NOT guess. Always fetch the real content first.""",
+        model=MODEL,
+        tools=ASSISTANT_TOOLS
+    )
+
+    with open(ASSISTANT_ID_FILE, "w") as f:
+        f.write(assistant.id)
+        print(f"Successfully created and cached new Assistant ID: {assistant.id}")
+    return assistant
+
+# Call the function once at startup to get the global assistant object
+try:
+    assistant = get_or_create_assistant()
+except Exception as e:
+    print(f"FATAL ERROR during Assistant initialization: {e}")
+    # Exit gracefully if the critical AI component fails to initialize
+    exit(1)
 
 def submit_tool_outputs(thread_id, run_id, tool_calls):
     """Executes the Python tool (fetch_blog_content) and submits the output back to the Assistant."""
@@ -378,22 +420,28 @@ def send_weekly_email(summaries):
     """
     Sends a PDF digest of weekly summaries.
     """
+    if not EMAIL_USER or not EMAIL_PASS:
+        print("Email credentials missing. Skipping email send.")
+        return
+
     if not summaries:
         print("No summaries to send this week.")
         return
 
     pdf_path = make_pdf(summaries)
 
-    yag = yagmail.SMTP(EMAIL_USER, EMAIL_PASS)
+    try:
+        yag = yagmail.SMTP(EMAIL_USER, EMAIL_PASS)
 
-    yag.send(
-        to=RECIPIENT_EMAIL,
-        subject="Your Weekly Tech Digest – Autumn",
-        contents="Attached is your weekly PDF report with all new summaries.",
-        attachments=pdf_path
-    )
-
-    print("Weekly report sent ✔")
+        yag.send(
+            to=RECIPIENT_EMAIL,
+            subject="Your Weekly Tech Digest – Autumn",
+            contents="Attached is your weekly PDF report with all new summaries.",
+            attachments=pdf_path
+        )
+        print("Weekly report sent ✔")
+    except Exception as e:
+        print(f"ERROR sending email: {e}")
 
 
 #schedular
@@ -417,9 +465,13 @@ def run_weekly():
 
     weekly_summaries = []
     for url, meta in storage["articles"].items():
-        date = datetime.fromisoformat(meta["date"])
-        if date > week_ago:
-            weekly_summaries.append(meta["summary"])
+        # Handle cases where 'date' might be missing or malformed for safety
+        try:
+            date = datetime.fromisoformat(meta["date"])
+            if date > week_ago:
+                weekly_summaries.append(meta["summary"])
+        except ValueError:
+            continue
 
     send_weekly_email(weekly_summaries)
 
@@ -429,10 +481,13 @@ schedule.every().friday.at("18:00").do(run_weekly)    # weekly report
 
 
 def scheduler_loop():
+    print("Autumn Agent Scheduler started. Waiting for next job...")
     while True:
-        print("--- ENVIRONMENT TEST SUCCESSFUL! ---")
         schedule.run_pending()
         time.sleep(60)
+
+if __name__ == "__main__":
+    scheduler_loop()
 
 
 
